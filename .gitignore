@@ -1,0 +1,10 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+chroma_db/
+chroma_db_web/
+*.pkl
+uploads/
+.env
+.streamlit/secrets.toml

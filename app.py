@@ -1,140 +1,151 @@
-import streamlit as st
 import os
-import tempfile
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain_community.llms import Ollama
-from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
+import time
+import uuid
+import logging
+import streamlit as st
+from pathlib import Path
 
-# Configuration de la page
-st.set_page_config(page_title="AI Legal Assistant - Maroc", page_icon="⚖️", layout="wide")
+from config import (
+    APP_TITLE, VERSION, LLM_MODEL, UPLOAD_DIR, MAX_FILE_MB, 
+    MAX_PROMPT_CHARS, SOURCE_PREVIEW_CHARS
+)
+from utils import (
+    sanitize_filename, safe_html, extract_article_numbers, build_pdf
+)
+from rag_engine import RAGEngine
 
-st.title("⚖️ AI Legal Assistant - Maroc")
-st.markdown("---")
-
-# Dossier pour la base de données vectorielle
-DB_DIR = "chroma_db_web"
-
-# Initialisation du modèle d'embeddings (mis en cache pour la performance)
+# ── Optimisation UI ──────────────────────────────────────────────────────────
 @st.cache_resource
-def load_embeddings():
-    return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+def get_engine():
+    """Cache le moteur pour éviter de recharger les embeddings à chaque clic."""
+    eng = RAGEngine()
+    eng.load_db()
+    return eng
 
-embeddings = load_embeddings()
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION STREAMLIT
+# ═══════════════════════════════════════════════════════════════════════════════
+st.set_page_config(
+    page_title=APP_TITLE,
+    page_icon="⚖️",
+    layout="wide"
+)
 
-# Barre latérale pour l'upload
+# Sidebar persistante
 with st.sidebar:
-    st.header("📁 Documents")
-    uploaded_files = st.file_uploader("Chargez vos documents juridiques (PDF)", type="pdf", accept_multiple_files=True)
+    st.title(f"{APP_TITLE}")
+    st.caption(f"v{VERSION} | Expert Juridique")
     
-    if uploaded_files:
-        if st.button(f"🚀 Analyser les {len(uploaded_files)} documents"):
-            with st.spinner("Analyse et indexation en cours..."):
-                all_docs = []
-                for uploaded_file in uploaded_files:
-                    # Sauvegarde temporaire de chaque fichier
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                        tmp_file.write(uploaded_file.getvalue())
-                        tmp_path = tmp_file.name
+    app_mode = st.selectbox(
+        "Menu Principal",
+        ["💬 Assistant", "📁 Mes Documents", "📜 Historique"],
+        key="navigation_select"
+    )
+    
+    st.markdown("---")
+    engine = get_engine()
+    db_ok = engine.vector_db is not None
+    st.status(f"Base de données : {'PRÊTE' if db_ok else 'VIDE'}", expanded=False)
+    
+    if st.button("🗑️ Purger la session"):
+        st.session_state.messages = []
+        st.rerun()
 
-                    # 1. Loading
-                    loader = PyPDFLoader(tmp_path)
-                    all_docs.extend(loader.load())
-                    os.remove(tmp_path)
-
-                # 2. Chunking
-                text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-                chunks = text_splitter.split_documents(all_docs)
-
-                # 3. Vector DB (On recrée la base avec tous les documents)
-                st.session_state.vector_db = Chroma.from_documents(
-                    documents=chunks,
-                    embedding=embeddings,
-                    persist_directory=DB_DIR
-                )
-                st.success(f"{len(uploaded_files)} documents analysés et indexés !")
-
-# Zone de Chat
-st.header("💬 Chat avec l'Expert Juridique")
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOGIQUE DE CHAT (OPTIMISÉE)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Affichage de l'historique
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        if "sources" in message and message["sources"]:
-            with st.expander("📚 Sources consultées"):
-                for src in message["sources"]:
-                    st.info(src)
+if app_mode == "💬 Assistant":
+    if not db_ok:
+        st.info("👋 Bonjour ! Veuillez d'abord indexer vos documents dans l'onglet 'Mes Documents'.")
+        st.stop()
 
-# Input de l'utilisateur
-if prompt := st.chat_input("Posez votre question sur le droit marocain..."):
-    if "vector_db" not in st.session_state:
-        st.error("Veuillez d'abord charger un document dans la barre latérale.")
-    else:
-        # Afficher le message utilisateur
+    # Affichage rapide de l'historique
+    for i, msg in enumerate(st.session_state.messages):
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if msg["role"] == "assistant" and "sources" in msg:
+                with st.expander("📚 Sources consultées"):
+                    for s in msg["sources"]:
+                        st.caption(s[:500] + "...")
+
+    # Traitement de la question
+    if prompt := st.chat_input("Posez votre question juridique ici..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Réponse de l'IA
         with st.chat_message("assistant"):
-            placeholder = st.empty()
+            response_placeholder = st.empty()
             full_response = ""
-            source_docs = []
             
-            with st.spinner("Recherche dans les documents..."):
-                try:
-                    llm = Ollama(model="qwen2:1.5b")
-                    
-                    system_prompt = (
-                        "Tu es un assistant juridique expert au Maroc. "
-                        "IMPORTANT: Tu dois détecter la langue de la question (Arabe, Français ou Anglais) "
-                        "et répondre obligatoirement dans cette MÊME LANGUE. "
-                        "Si la question est en ARABE, réponds en ARABE. "
-                        "Si la question est en FRANÇAIS, réponds en FRANÇAIS. "
-                        "Utilise les extraits fournis pour ta réponse.\n\n"
-                        "CONTEXTE JURIDIQUE :\n{context}"
-                    )
-                    
-                    qa_prompt = ChatPromptTemplate.from_messages([
-                        ("system", system_prompt),
-                        ("human", "{input}"),
-                    ])
-
-                    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
-                    rag_chain = create_retrieval_chain(st.session_state.vector_db.as_retriever(), question_answer_chain)
-
-                    # Streaming de la réponse
-                    for chunk in rag_chain.stream({"input": prompt}):
-                        if "context" in chunk:
-                            source_docs = chunk["context"]
+            try:
+                # Analyse rapide de la question
+                asked = extract_article_numbers(prompt, False)
+                art_num = asked[0] if asked else None
+                
+                if art_num:
+                    sys_prompt = f"Tu es un expert juridique marocain. Réponds précisément en français. Analyse l'Article {art_num}.\nCONTEXTE :\n{{context}}"
+                else:
+                    sys_prompt = "Tu es un expert juridique marocain. Réponds précisément en français.\nCONTEXTE :\n{context}"
+                
+                with st.spinner("Analyse juridique en cours..."):
+                    stream = engine.query(prompt, sys_prompt, art_num)
+                    for chunk in stream:
                         if "answer" in chunk:
                             full_response += chunk["answer"]
-                            placeholder.markdown(full_response + "▌")
-                    
-                    placeholder.markdown(full_response)
-                    
-                    # Affichage des sources
-                    sources_content = []
-                    if source_docs:
-                        with st.expander("📚 Sources consultées"):
-                            for i, doc in enumerate(source_docs):
-                                st.markdown(f"**Extrait {i+1} :**")
-                                st.info(doc.page_content)
-                                sources_content.append(doc.page_content)
-                    
-                    st.session_state.messages.append({
-                        "role": "assistant", 
-                        "content": full_response,
-                        "sources": sources_content
-                    })
-                    
-                except Exception as e:
-                    st.error(f"Erreur : {e}")
+                            response_placeholder.markdown(full_response + "▌")
+                
+                response_placeholder.markdown(full_response)
+                
+                # Sauvegarde immédiate
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": full_response
+                })
+                
+            except Exception as e:
+                st.error(f"Désolé, une erreur est survenue : {str(e)}")
+
+elif app_mode == "📁 Mes Documents":
+    st.header("📚 Gestionnaire de Bibliothèque")
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        uploaded = st.file_uploader("Ajouter un Code de Loi (PDF)", type="pdf")
+        if uploaded and st.button("Confirmer l'ajout"):
+            with open(os.path.join(UPLOAD_DIR, uploaded.name), "wb") as f:
+                f.write(uploaded.getbuffer())
+            st.success("Fichier ajouté.")
+            st.rerun()
+
+    with col2:
+        st.subheader("Fichiers présents")
+        for f in os.listdir(UPLOAD_DIR):
+            if f.endswith(".pdf"):
+                st.text(f"📄 {f}")
+
+    if st.button("🚀 Lancer l'analyse et l'indexation", type="primary"):
+        paths = [os.path.join(UPLOAD_DIR, f) for f in os.listdir(UPLOAD_DIR) if f.endswith(".pdf")]
+        if not paths:
+            st.error("Aucun document trouvé.")
+        else:
+            bar = st.progress(0)
+            def update_bar(p, t): bar.progress(p, text=t)
+            if engine.index_documents(paths, update_bar):
+                st.success("Indexation terminée ! L'IA est prête.")
+                time.sleep(1)
+                st.rerun()
+
+elif app_mode == "📜 Historique":
+    st.header("📜 Historique des échanges")
+    if not st.session_state.messages:
+        st.write("Aucun historique pour le moment.")
+    else:
+        for i, m in enumerate(reversed(st.session_state.messages)):
+            with st.expander(f"Question {len(st.session_state.messages)-i}: {m['content'][:60]}..."):
+                st.write(m['content'])
